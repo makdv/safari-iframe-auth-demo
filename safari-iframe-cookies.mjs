@@ -1,10 +1,10 @@
 // Run with `node safari-iframe-cookies.mjs` using an already trusted mkcert CA.
 // The identity service and partner simulate login using loopback-only servers.
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { createServer } from 'node:https';
+import { createServer, request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,7 +15,16 @@ const origins = [web, id, partner];
 const hosts = origins.map((origin) => new URL(origin).hostname);
 const storageAccessFlow = 'storage-access';
 const flows = new Set(['iframe', 'partitioned', storageAccessFlow]);
-const partnerFlows = new Map();
+const protectedPath = '/protected';
+const clientId = 'avia-demo';
+const redirectUri = `${partner}/callback`;
+const attemptPattern = /^[a-f0-9]{16}$/;
+const opaqueValuePattern = /^[A-Za-z0-9_-]{43}$/;
+const verifierPattern = /^[A-Za-z0-9._~-]{43,128}$/;
+const partnerTransactions = new Map();
+const partnerSessions = new Map();
+const identityTransactions = new Map();
+const authorizationCodes = new Map();
 const partnerCookiePrefix = '__Host-demo-partner-';
 const sessionSeconds = 600;
 const codeSeconds = 60;
@@ -148,8 +157,9 @@ const bottomSheet = `
   </script>`;
 
 function localCertificate() {
-  const ca = execFileSync('mkcert', ['-CAROOT'], { encoding: 'utf8' }).trim();
-  if (!existsSync(join(ca, 'rootCA.pem'))) {
+  const caRoot = execFileSync('mkcert', ['-CAROOT'], { encoding: 'utf8' }).trim();
+  const caPath = join(caRoot, 'rootCA.pem');
+  if (!existsSync(caPath)) {
     throw new Error('This HTTPS demo needs a trusted local CA from mkcert.');
   }
 
@@ -158,7 +168,7 @@ function localCertificate() {
     const cert = join(directory, 'cert.pem');
     const key = join(directory, 'key.pem');
     execFileSync('mkcert', ['-cert-file', cert, '-key-file', key, ...hosts]);
-    return { cert: readFileSync(cert), key: readFileSync(key) };
+    return { cert: readFileSync(cert), key: readFileSync(key), ca: readFileSync(caPath) };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -211,9 +221,9 @@ function redirect(response, location, cookie) {
   response.writeHead(302).end();
 }
 
-function sessionCookie(name, value, partitioned, sameSite = 'None') {
+function demoCookie(name, value, { partitioned, sameSite = 'None', maxAge = sessionSeconds }) {
   const partition = partitioned ? '; Partitioned' : '';
-  return `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=${sameSite}; Max-Age=${sessionSeconds}${partition}`;
+  return `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=${sameSite}; Max-Age=${maxAge}${partition}`;
 }
 
 function readCookies(request) {
@@ -228,16 +238,16 @@ function readCookies(request) {
   return cookies;
 }
 
-function rememberPartnerFlow(attempt, { flow, sameSite }, phase, lifetime, value) {
-  const entry = { flow, sameSite, phase, value, expiresAt: Date.now() + lifetime * 1000 };
-  partnerFlows.set(attempt, entry);
+function remember(store, key, value, lifetime = sessionSeconds) {
+  const entry = { ...value, expiresAt: Date.now() + lifetime * 1000 };
+  store.set(key, entry);
   setTimeout(() => {
-    if (partnerFlows.get(attempt) === entry) partnerFlows.delete(attempt);
+    if (store.get(key) === entry) store.delete(key);
   }, lifetime * 1000).unref();
 }
 
-function activePartnerFlow(attempt) {
-  const entry = partnerFlows.get(attempt);
+function activeEntry(store, key) {
+  const entry = store.get(key);
   return entry?.expiresAt > Date.now() ? entry : undefined;
 }
 
@@ -249,26 +259,195 @@ function partnerCookieName(flow, attempt) {
   return `${partnerCookiePrefix}${cookieMode(flow).toLowerCase()}-${attempt}`;
 }
 
-function partnerLandingUrl(attempt, flow) {
-  const path = flow === storageAccessFlow ? '/storage-access/signed-in' : '/';
-  return route(partner, path, attempt, flow);
+function pkceChallenge(verifier) {
+  return createHash('sha256').update(verifier, 'ascii').digest('base64url');
 }
 
-function partnerCallback(response, searchParams, attempt, flow) {
-  const state = activePartnerFlow(attempt);
+function transactionCookieName(attempt) {
+  return `__Host-demo-transaction-${attempt}`;
+}
+
+function startPartnerSignIn(response, flow, sameSite, embedAttempt) {
+  const attempt = randomBytes(8).toString('hex');
+  const state = randomBytes(32).toString('base64url');
+  const verifier = randomBytes(32).toString('base64url');
+  const browserKey = randomBytes(32).toString('base64url');
+  remember(partnerTransactions, state, { attempt, flow, sameSite, embedAttempt, verifier, browserKey });
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid',
+    state,
+    code_challenge: pkceChallenge(verifier),
+    code_challenge_method: 'S256',
+    flow,
+    sameSite,
+  });
+  const cookie = demoCookie(transactionCookieName(attempt), browserKey, { partitioned: flow === 'partitioned' });
+  return redirect(response, `${id}/authorize?${params}`, cookie);
+}
+
+async function readBody(message) {
+  message.setEncoding('utf8');
+  let body = '';
+  for await (const chunk of message.iterator({ destroyOnReturn: false })) {
+    body += chunk;
+    if (body.length > 4096) {
+      message.resume();
+      return undefined;
+    }
+  }
+  return body;
+}
+
+async function exchangeCode(code, verifier) {
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    code,
+    code_verifier: verifier,
+  }).toString();
+
+  const response = await new Promise((resolve, reject) => {
+    const request = httpsRequest(`${id}/token`, {
+      ca: identityCA,
+      method: 'POST',
+      timeout: 5000,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, resolve);
+    request.on('error', reject);
+    request.on('timeout', () => request.destroy(new Error('Token request timed out')));
+    request.end(body);
+  });
+
+  const payload = JSON.parse(await readBody(response));
+  if (response.statusCode === 400 && payload?.error === 'invalid_grant') return false;
+  if (response.statusCode !== 200 || payload?.token_type !== 'Bearer' ||
+      typeof payload.access_token !== 'string' || !opaqueValuePattern.test(payload.access_token)) {
+    throw new Error('Unexpected token response');
+  }
+  return true;
+}
+
+async function partnerCallback(request, response, searchParams) {
   response.setHeader('Referrer-Policy', 'no-referrer');
-  if (state?.phase !== 'callback' || state.flow !== flow || state.value !== searchParams.get('code')) {
-    return page(response, 403, '403 · Partner callback expired or invalid', `<p>${signInOptions(state?.sameSite)}</p>`);
+  const [state, extraState] = searchParams.getAll('state');
+  const [code, extraCode] = searchParams.getAll('code');
+  const transaction = activeEntry(partnerTransactions, state);
+  if (!transaction || extraState !== undefined || extraCode !== undefined || !opaqueValuePattern.test(code ?? '')) {
+    return page(response, 403, '403 · Invalid or expired sign-in response', `<p>${signInOptions(transaction?.sameSite)}</p>`);
+  }
+
+  const { attempt, flow, sameSite, embedAttempt, verifier, browserKey } = transaction;
+  const transactionCookie = transactionCookieName(attempt);
+  if (readCookies(request).get(transactionCookie) !== browserKey) {
+    return page(response, 403, '403 · Avia sign-in cookie missing or invalid', `
+      <p>The callback needs the transaction cookie from Avia’s <code>/start</code> to verify <code>state</code>.</p>
+      <p>${signInOptions(sameSite)}</p>`);
+  }
+
+  // Claim this transaction before awaiting the exchange so a second callback cannot use it.
+  partnerTransactions.delete(state);
+  let exchanged;
+  try {
+    exchanged = await exchangeCode(code, verifier);
+  } catch {
+    console.log(`${flow} ${attempt} partner /callback could not complete the ID /token request`);
+    return page(response, 502, '502 · Partner token exchange unavailable', `<p>${signInOptions(sameSite)}</p>`);
+  }
+  if (!exchanged) {
+    return page(response, 403, '403 · ID provider rejected the code exchange', `<p>${signInOptions(sameSite)}</p>`);
   }
 
   const session = randomBytes(24).toString('base64url');
-  rememberPartnerFlow(attempt, state, 'session', sessionSeconds, session);
-  const cookie = sessionCookie(partnerCookieName(flow, attempt), session, flow === 'partitioned', state.sameSite);
-  console.log(`${flow} ${attempt} partner /callback sent Set-Cookie with SameSite=${state.sameSite}`);
-  return redirect(response, partnerLandingUrl(attempt, flow), cookie);
+  remember(partnerSessions, attempt, { flow, sameSite, embedAttempt, value: session });
+  const partitioned = flow === 'partitioned';
+  const cookie = demoCookie(partnerCookieName(flow, attempt), session, { partitioned, sameSite });
+  const clearTransaction = demoCookie(transactionCookie, '', { partitioned, maxAge: 0 });
+  console.log(`${flow} ${attempt} partner /callback verified state and exchanged the code with PKCE, then set SameSite=${sameSite}`);
+  return redirect(response, route(partner, protectedPath, attempt, flow), [cookie, clearTransaction]);
 }
 
-function findPartnerSession(request, attempt, flow) {
+function authorize(response, searchParams, sameSite) {
+  const flow = searchParams.get('flow');
+  const state = searchParams.get('state');
+  const challenge = searchParams.get('code_challenge');
+  if (!flows.has(flow) || searchParams.get('client_id') !== clientId ||
+      searchParams.get('redirect_uri') !== redirectUri || searchParams.get('response_type') !== 'code' ||
+      searchParams.get('scope') !== 'openid' || searchParams.get('code_challenge_method') !== 'S256' ||
+      !opaqueValuePattern.test(challenge) || !opaqueValuePattern.test(state)) {
+    return page(response, 400, '400 · Invalid authorization request', `<p>${signInOptions(sameSite)}</p>`);
+  }
+
+  const attempt = randomBytes(8).toString('hex');
+  const loginKey = randomBytes(32).toString('base64url');
+  remember(identityTransactions, attempt, { flow, state, challenge, loginKey, sameSite });
+  const cookie = demoCookie(`__Host-demo-id-${attempt}`, loginKey, { partitioned: flow === 'partitioned' });
+  console.log(`${flow} ${attempt} ID /authorize sent Set-Cookie`);
+  return redirect(response, route(id, '/login', attempt), cookie);
+}
+
+function identityLogin(request, response, attempt) {
+  const transaction = activeEntry(identityTransactions, attempt);
+  if (!transaction) {
+    return page(response, 403, '403 · Sign-in attempt expired', `<p>${signInOptions()}</p>`);
+  }
+
+  const { flow, state, challenge, loginKey, sameSite } = transaction;
+  const name = `__Host-demo-id-${attempt}`;
+  if (readCookies(request).get(name) !== loginKey) {
+    console.log(`${flow} ${attempt} ID /login returned HTTP 403 because the identity cookie was missing or invalid`);
+    return page(response, 403, '403 · Identity provider cookie missing or invalid', `
+      <p><code>/authorize</code> sent a ${cookieMode(flow).toLowerCase()} cookie with <code>SameSite=None</code>. <code>/login</code> received no matching cookie.</p>
+      <p>${signInOptions(sameSite)}</p>`);
+  }
+
+  identityTransactions.delete(attempt);
+  const code = randomBytes(32).toString('base64url');
+  remember(authorizationCodes, code, { challenge, clientId, redirectUri }, codeSeconds);
+  const params = new URLSearchParams({ code, state });
+  const clearTransaction = demoCookie(name, '', { partitioned: flow === 'partitioned', maxAge: 0 });
+  console.log(`${flow} ${attempt} ID /login verified the identity cookie and issued a one-time code`);
+  return redirect(response, `${redirectUri}?${params}`, clearTransaction);
+}
+
+function tokenResponse(response, status, payload) {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', Pragma: 'no-cache' });
+  response.end(JSON.stringify(payload));
+}
+
+async function issueToken(request, response) {
+  const contentType = request.headers['content-type']?.split(';')[0].trim().toLowerCase();
+  if (contentType !== 'application/x-www-form-urlencoded') {
+    return tokenResponse(response, 400, { error: 'invalid_request' });
+  }
+  const body = await readBody(request);
+  if (!body) return tokenResponse(response, 400, { error: 'invalid_request' });
+  const params = new URLSearchParams(body);
+  if (params.get('grant_type') !== 'authorization_code') {
+    return tokenResponse(response, 400, { error: 'unsupported_grant_type' });
+  }
+
+  const code = params.get('code');
+  const verifier = params.get('code_verifier');
+  const grant = activeEntry(authorizationCodes, code);
+  if (!grant || grant.clientId !== params.get('client_id') || grant.redirectUri !== params.get('redirect_uri') ||
+      !verifierPattern.test(verifier) || grant.challenge !== pkceChallenge(verifier)) {
+    return tokenResponse(response, 400, { error: 'invalid_grant' });
+  }
+
+  authorizationCodes.delete(code);
+  console.log('ID /token verified S256 PKCE and redeemed the one-time code');
+  return tokenResponse(response, 200, { access_token: randomBytes(32).toString('base64url'), token_type: 'Bearer' });
+}
+
+function findPartnerSession(request, { attempt, flow, embedAttempt, sameSite }) {
   // A result URL checks its own run. The bare partner page accepts any active session cookie.
   let receivedCookie = false;
   for (const [name, value] of readCookies(request)) {
@@ -276,30 +455,32 @@ function findPartnerSession(request, attempt, flow) {
     const sessionAttempt = name.slice(name.lastIndexOf('-') + 1);
     if (attempt && sessionAttempt !== attempt) continue;
     if (flow && name !== partnerCookieName(flow, sessionAttempt)) continue;
+    const state = activeEntry(partnerSessions, sessionAttempt);
+    if (embedAttempt && (state?.embedAttempt !== embedAttempt || state.sameSite !== sameSite)) continue;
     receivedCookie = true;
-    const state = activePartnerFlow(sessionAttempt);
-    if (state?.phase !== 'session' || state.value !== value || partnerCookieName(state.flow, sessionAttempt) !== name) continue;
+    if (!state || state.value !== value || partnerCookieName(state.flow, sessionAttempt) !== name) continue;
     return { session: { name, flow: state.flow, sameSite: state.sameSite }, receivedCookie };
   }
   return { receivedCookie };
 }
 
 function partnerMainPage(request, response, attempt, flow, selectedSameSite) {
-  const { session, receivedCookie } = findPartnerSession(request, attempt, flow);
-  const expected = activePartnerFlow(attempt);
-  const callback = session ?? (expected?.phase === 'session' && expected.flow === flow ? expected : undefined);
+  const { session, receivedCookie } = findPartnerSession(request, { attempt, flow });
+  const expected = activeEntry(partnerSessions, attempt);
+  const callback = session ?? (expected?.flow === flow ? expected : undefined);
   const status = session ? 200 : 403;
   const title = session ? '200 · Hello from the partner main page' : '403 · Partner session required';
   const failure = receivedCookie ? 'The partner received an invalid or expired session cookie.' : 'The partner session cookie for this run is missing.';
   const result = session ? `${cookieMode(session.flow)} cookie <code>${session.name}</code> works.` : failure;
-  const mainUrl = attempt ? route(partner, '/', attempt, flow, flow ? undefined : selectedSameSite) : `${partner}/`;
+  const mainUrl = attempt ? route(partner, protectedPath, attempt, flow, flow ? undefined : selectedSameSite) : `${partner}${protectedPath}`;
   const cookieFlags = callback?.flow === 'partitioned' ? '; Partitioned' : '';
-  console.log(`${flow ?? 'gate'} ${attempt ?? 'direct'} partner / returned HTTP ${status}`);
+  console.log(`${flow ?? 'gate'} ${attempt ?? 'direct'} partner ${protectedPath} returned HTTP ${status}`);
   return page(response, status, title, `
     <p>${result}</p>
     <dl>
       <dt>Identity provider /login</dt><dd>${callback ? 'Cookie verified before the partner callback' : 'Sign-in required'}</dd>
-      ${callback ? `<dt>Partner /callback cookie</dt><dd><code>SameSite=${callback.sameSite}${cookieFlags}</code></dd>` : ''}
+      ${callback ? `<dt>Partner /callback</dt><dd>State verified. Code exchanged at ID /token with PKCE.</dd>
+      <dt>Partner session cookie</dt><dd><code>SameSite=${callback.sameSite}${cookieFlags}</code></dd>` : ''}
     </dl>
     <p>${link(mainUrl, 'Check partner session again')} · ${signInOptions(callback?.sameSite ?? selectedSameSite)}</p>`, `
       body { margin-block: .8rem; }
@@ -309,7 +490,7 @@ function partnerMainPage(request, response, attempt, flow, selectedSameSite) {
 
 function storageAccessPage(response, attempt, sameSite) {
   const start = route(partner, '/start', attempt, storageAccessFlow, sameSite);
-  const check = route(partner, '/storage-access/session', attempt, storageAccessFlow);
+  const check = `${partner}${protectedPath}?${new URLSearchParams({ embedAttempt: attempt, sameSite })}`;
   return page(response, 200, 'Sign in with Storage Access', `
     <p>Partner session cookie <code>SameSite=${sameSite}</code></p>
     <ol>
@@ -376,7 +557,7 @@ function storageAccessPage(response, attempt, sameSite) {
 }
 
 function storageAccessSignedIn(request, response, attempt, confirmed) {
-  const { session } = findPartnerSession(request, attempt, storageAccessFlow);
+  const { session } = findPartnerSession(request, { attempt, flow: storageAccessFlow });
   if (!session) {
     return page(response, 403, '403 · Partner session required', '<p>Return to the original tab and start a fresh sign-in.</p>');
   }
@@ -386,7 +567,7 @@ function storageAccessSignedIn(request, response, attempt, confirmed) {
       <script>window.close();</script>`);
   }
 
-  const confirm = new URL(partnerLandingUrl(attempt, storageAccessFlow));
+  const confirm = new URL(route(partner, protectedPath, attempt, storageAccessFlow));
   confirm.searchParams.set('confirmed', '1');
   return page(response, 200, '200 · Signed in to the partner', `
     <p>The partner received its <code>SameSite=${session.sameSite}</code> session cookie in this tab.</p>
@@ -401,30 +582,40 @@ function storageAccessSignedIn(request, response, attempt, confirmed) {
     </script>`);
 }
 
-function storageAccessSession(request, response, attempt) {
-  const { session } = findPartnerSession(request, attempt, storageAccessFlow);
-  const state = activePartnerFlow(attempt);
-  const sameSite = state?.phase === 'session' && state.flow === storageAccessFlow ? state.sameSite : undefined;
+function storageAccessSession(request, response, embedAttempt, sameSite) {
+  const { session } = findPartnerSession(request, { embedAttempt, sameSite, flow: storageAccessFlow });
+  const now = Date.now();
+  const callbackCompleted = session || [...partnerSessions.values()].some((state) =>
+    state.embedAttempt === embedAttempt && state.sameSite === sameSite && state.expiresAt > now);
   const status = session ? 200 : 403;
-  console.log(`${storageAccessFlow} ${attempt} partner session check returned HTTP ${status}`);
+  console.log(`${storageAccessFlow} ${embedAttempt} partner ${protectedPath} returned HTTP ${status}`);
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-  response.end(JSON.stringify({ cookieName: session?.name, sameSite }));
+  response.end(JSON.stringify({ cookieName: session?.name, sameSite: callbackCompleted ? sameSite : undefined }));
 }
 
-function serve(origin, request, response) {
+async function serve(origin, request, response) {
   const url = new URL(request.url, origin);
   const { pathname, searchParams } = url;
   const sameSite = searchParams.get('sameSite') === 'Lax' ? 'Lax' : 'None';
   response.setHeader('Cache-Control', 'no-store');
-  if (request.headers.host !== new URL(origin).host || request.method !== 'GET') {
-    response.writeHead(400).end();
-    return;
+  if (request.headers.host !== new URL(origin).host) return response.writeHead(400).end();
+  if (origin === id && pathname === '/token') {
+    if (request.method !== 'POST') return response.writeHead(405, { Allow: 'POST' }).end();
+    return issueToken(request, response);
+  }
+  if (request.method !== 'GET') return response.writeHead(405, { Allow: 'GET' }).end();
+
+  if (origin === id) {
+    response.setHeader('Referrer-Policy', 'no-referrer');
+    if (pathname === '/authorize') return authorize(response, searchParams, sameSite);
+    if (pathname === '/login') return identityLogin(request, response, searchParams.get('attempt'));
+    return response.writeHead(404).end();
   }
 
   if (origin === web && pathname === '/') {
     return page(response, 200, 'Safari bottom-sheet cookie demo', `
       <p>The web app and identity provider are sibling subdomains. The partner is on a different site.</p>
-      <p>Partner <code>/start</code> → ID <code>/authorize</code> → ID <code>/login</code> → Partner <code>/callback</code> → Partner main page</p>
+      <p>Public partner <code>/start</code> → ID <code>/authorize</code> → ID <code>/login</code> → Partner <code>/callback</code> → Partner <code>${protectedPath}</code></p>
       ${bottomSheet}`, bottomSheetStyles);
   }
 
@@ -442,7 +633,7 @@ function serve(origin, request, response) {
           <button type="submit" name="flow" value="iframe">Sign in with regular cookies</button>
           <button type="submit" name="flow" value="partitioned">Sign in with partitioned cookies</button>
           <button type="submit" name="flow" value="${storageAccessFlow}" formaction="${partner}/storage-access">Use Storage Access for older Safari</button>
-          <button type="submit" formaction="${partner}/">Check partner without sign-in (expected 403)</button>
+          <button type="submit" formaction="${partner}${protectedPath}">Check partner without sign-in (expected 403)</button>
         </div>
       </form>`, `
         body { margin-block: .8rem; }
@@ -457,8 +648,25 @@ function serve(origin, request, response) {
 
   const attempt = searchParams.get('attempt');
   const flow = searchParams.get('flow');
-  const validAttempt = /^[a-f0-9]{16}$/.test(attempt ?? '');
-  if (origin === partner && pathname === '/') {
+  const validAttempt = attemptPattern.test(attempt ?? '');
+  if (origin === partner && pathname === '/start') {
+    const loginFlow = flow ?? 'iframe';
+    if (!flows.has(loginFlow)) {
+      return page(response, 400, '400 · Unknown sign-in flow', `<p>${signInOptions(sameSite)}</p>`);
+    }
+    const embedAttempt = loginFlow === storageAccessFlow && validAttempt ? attempt : undefined;
+    return startPartnerSignIn(response, loginFlow, sameSite, embedAttempt);
+  }
+  if (origin === partner && pathname === '/callback') return partnerCallback(request, response, searchParams);
+  if (origin === partner && (pathname === protectedPath || pathname === '/')) {
+    const embedAttempt = searchParams.get('embedAttempt');
+    if (embedAttempt !== null) {
+      if (!attemptPattern.test(embedAttempt)) return response.writeHead(400).end();
+      return storageAccessSession(request, response, embedAttempt, sameSite);
+    }
+    if (validAttempt && flow === storageAccessFlow) {
+      return storageAccessSignedIn(request, response, attempt, searchParams.get('confirmed') === '1');
+    }
     return partnerMainPage(request, response, validAttempt ? attempt : undefined,
       validAttempt && flows.has(flow) ? flow : undefined, sameSite);
   }
@@ -467,57 +675,15 @@ function serve(origin, request, response) {
     return;
   }
 
-  if (origin === partner && pathname === '/start') {
-    const loginAttempt = flow === storageAccessFlow ? attempt : randomBytes(8).toString('hex');
-    const state = activePartnerFlow(loginAttempt);
-    if (state && (state.flow !== flow || state.sameSite !== sameSite)) {
-      return page(response, 403, '403 · Sign-in attempt invalid', `<p>${signInOptions(sameSite)}</p>`);
-    }
-    if (state?.phase === 'session') return redirect(response, partnerLandingUrl(loginAttempt, flow));
-    if (!state) rememberPartnerFlow(loginAttempt, { flow, sameSite }, 'login', sessionSeconds);
-    return redirect(response, route(id, '/authorize', loginAttempt, flow));
-  }
   if (origin === partner) {
-    if (pathname === '/callback') return partnerCallback(response, searchParams, attempt, flow);
-    if (pathname === '/session') return redirect(response, route(partner, '/', attempt, flow));
+    if (pathname === '/session') return redirect(response, route(partner, protectedPath, attempt, flow));
     if (flow === storageAccessFlow) {
       if (pathname === '/storage-access') return storageAccessPage(response, attempt, sameSite);
       if (pathname === '/storage-access/signed-in') return storageAccessSignedIn(request, response, attempt, searchParams.get('confirmed') === '1');
-      if (pathname === '/storage-access/session') return storageAccessSession(request, response, attempt);
+      if (pathname === '/storage-access/session') return storageAccessSession(request, response, attempt, sameSite);
     }
   }
-  if (origin !== id || !['/authorize', '/login'].includes(pathname)) {
-    response.writeHead(404).end();
-    return;
-  }
-
-  const state = activePartnerFlow(attempt);
-  if (state?.flow !== flow) {
-    return page(response, 403, '403 · Sign-in attempt expired', `<p>${signInOptions()}</p>`);
-  }
-
-  const name = `__Host-demo-${attempt}-${flow}`;
-  if (pathname === '/authorize') {
-    console.log(`${flow} ${attempt} /authorize sent Set-Cookie`);
-    const cookie = sessionCookie(name, 'issued', flow === 'partitioned');
-    return redirect(response, route(id, '/login', attempt, flow), cookie);
-  }
-
-  if (readCookies(request).get(name) !== 'issued') {
-    console.log(`${flow} ${attempt} /login returned HTTP 403 because the identity cookie was missing`);
-    return page(response, 403, '403 · Identity provider cookie missing', `
-      <p><code>/authorize</code> sent a ${cookieMode(flow).toLowerCase()} cookie with <code>SameSite=None</code>. <code>/login</code> received no matching cookie.</p>
-      <p>${signInOptions(state.sameSite)}</p>`);
-  }
-
-  if (state.phase === 'session') return redirect(response, partnerLandingUrl(attempt, flow));
-  const code = state.phase === 'callback' ? state.value : randomBytes(24).toString('base64url');
-  if (state.phase === 'login') rememberPartnerFlow(attempt, state, 'callback', codeSeconds, code);
-  const callback = new URL(route(partner, '/callback', attempt, flow));
-  callback.searchParams.set('code', code);
-  response.setHeader('Referrer-Policy', 'no-referrer');
-  console.log(`${flow} ${attempt} /login verified the identity cookie and redirected to the partner callback`);
-  return redirect(response, callback.href);
+  response.writeHead(404).end();
 }
 
 await Promise.all(hosts.map(async (host) => {
@@ -527,9 +693,15 @@ await Promise.all(hosts.map(async (host) => {
   }
 }));
 
-const tls = localCertificate();
+const { ca: identityCA, ...tls } = localCertificate();
 await Promise.all(origins.map((origin) => new Promise((resolve, reject) => {
-  const server = createServer(tls, (request, response) => serve(origin, request, response));
+  const server = createServer(tls, (request, response) => {
+    serve(origin, request, response).catch(() => {
+      console.error('Demo request failed');
+      if (!response.headersSent) response.writeHead(500);
+      response.end();
+    });
+  });
   server.once('error', reject);
   server.listen(Number(new URL(origin).port), '127.0.0.1', resolve);
 })));

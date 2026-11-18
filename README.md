@@ -2,6 +2,15 @@
 
 The demo runs a web app, an identity provider, and a partner on three local HTTPS ports. The web app and identity provider share a site. The partner is cross-site and stays inside the draggable bottom sheet.
 
+**Public partner `/start` → ID `/authorize` → ID `/login` → partner `/callback` → protected partner `/protected`.**
+
+1. Avia’s `/start` creates a fresh `state`, a private PKCE verifier, and a short-lived transaction cookie. It sends the S256 challenge to the ID provider.
+2. ID `/authorize` sets its own transaction cookie. ID `/login` checks that cookie and redirects to Avia with a one-time code and the original `state`.
+3. Avia’s `/callback` matches `state` to the browser’s transaction cookie, then sends the code and the private verifier to ID `POST /token` over HTTPS. The ID provider checks the S256 challenge and consumes the code. This request appears in the server log.
+4. Avia issues its session cookie after a successful exchange. `/protected` checks the cookie on the next request.
+
+The SameSite switch controls Avia’s session cookie. Both transaction cookies use `SameSite=None` so the demo can show cases where the exchange succeeds and `/protected` still returns `403`. Use **Check partner without sign-in** to test the gate directly. [PKCE verification](https://www.rfc-editor.org/rfc/rfc7636.html#section-4.6) · [SameSite cookie rules](https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-4.1.2.7)
+
 ## Run locally
 
 With Node.js and an already trusted [mkcert](https://github.com/FiloSottile/mkcert) CA, run the server from this repo.
@@ -12,7 +21,7 @@ node safari-iframe-cookies.mjs
 
 Open the [demo](https://web.127-0-0-1.sslip.io:8740/) in a regular Safari window. Choose **None** and **Use Storage Access for older Safari**. Open the sign-in tab, select **Confirm sign-in**, then select **Continue in the sheet** in the original tab. Safari may ask for storage access. **Lax** demonstrates a successful top-level sign-in followed by `403` from the embedded session check.
 
-The demo simulates authentication and stores its sessions in memory. Production code uses Avia’s existing identity-provider integration and session store.
+The demo simulates user authentication, issues an opaque mock token, and stores sessions in memory. In production, Avia’s OIDC client validates the provider’s ID token before creating a session.
 
 ## Your side at `web.example.com`
 
@@ -28,10 +37,10 @@ If your app restricts `frame-src` in its Content Security Policy, include `https
 
 ## Avia’s entry page at `/embed/continue`
 
-Serve this page from `my.avia.com` before the iframe has cookie access. `/embed/sign-in` starts Avia’s existing login in a separate tab.
+Serve this page from `my.avia.com` before the iframe has cookie access. The public `/start` route redirects to Avia’s identity provider. This Storage Access flow opens it in a separate tab.
 
 ```html
-<a id="sign-in" href="/embed/sign-in" target="_blank" rel="noopener">
+<a id="sign-in" href="/start" target="_blank" rel="noopener">
   Sign in to Avia in a new tab
 </a>
 <button id="continue" type="button">Continue in the sheet</button>
@@ -65,7 +74,10 @@ continueButton.addEventListener('click', async () => {
   }
 
   try {
-    const response = await fetch('/embed/session', { credentials: 'same-origin' });
+    const response = await fetch('/protected', {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+    });
     if (response.ok) {
       statusElement.textContent = 'Signed in to Avia.';
       // Render your signed-in UI here in this iframe document.
@@ -84,7 +96,7 @@ Call `requestStorageAccess()` from the **Continue in the sheet** click inside Av
 
 ## Avia’s callback and session check
 
-Route `/embed/sign-in` through Avia’s existing OAuth or OIDC flow. Keep `/embed/signed-in` as a fixed, server-controlled continuation. Call `finishEmbeddedSignIn` after the callback has validated the authorization response and created the session. The snippets use Express-style handlers with Avia’s existing cookie parser and `lookupActiveAviaSession` adapter. [OAuth security best practices](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1)
+Route the public `/start` through Avia’s existing OAuth or OIDC flow. Keep `/protected` as a fixed, server-controlled continuation. Call `finishEmbeddedSignIn` after the callback has validated the authorization response and created the session. The snippets use Express-style handlers with Avia’s existing cookie parser and `lookupActiveAviaSession` adapter. [OAuth security best practices](https://www.rfc-editor.org/rfc/rfc9700.html#section-2.1)
 
 ```js
 function finishEmbeddedSignIn(res, sessionId) {
@@ -95,7 +107,7 @@ function finishEmbeddedSignIn(res, sessionId) {
     secure: true,
     sameSite: 'none',
   });
-  return res.redirect(303, '/embed/signed-in');
+  return res.redirect(303, '/protected');
 }
 
 async function requireAviaSession(req, res, next) {
@@ -111,12 +123,11 @@ async function requireAviaSession(req, res, next) {
   }
 }
 
-app.get('/embed/session', requireAviaSession, (req, res) => {
-  res.json({ signedIn: true });
-});
-
-app.get('/embed/signed-in', requireAviaSession, (req, res) => {
-  res.render('embed-signed-in');
+app.get('/protected', requireAviaSession, (req, res) => {
+  if (req.get('Accept') === 'application/json') {
+    return res.json({ signedIn: true });
+  }
+  return res.render('embed-signed-in');
 });
 
 app.get('/embed/confirmed', requireAviaSession, (req, res) => {
@@ -128,7 +139,7 @@ Use a regular cookie with `SameSite=None; Secure` for Storage Access. The grant 
 
 ## Close the sign-in tab after confirmation
 
-Render this link on Avia’s top-level `/embed/signed-in` page. The click happens on Avia’s site and gives Safari the first-party interaction it needs. [WebKit’s first-party interaction requirements](https://webkit.org/blog/11545/updates-to-the-storage-access-api/#how-to-1-meet-and-greet-the-user-as-first-party)
+For the Storage Access flow, render this link on Avia’s top-level `/protected` page. The click happens on Avia’s site and gives Safari the first-party interaction it needs. [WebKit’s first-party interaction requirements](https://webkit.org/blog/11545/updates-to-the-storage-access-api/#how-to-1-meet-and-greet-the-user-as-first-party)
 
 ```html
 <a id="confirm" href="/embed/confirmed">Confirm sign-in</a>
